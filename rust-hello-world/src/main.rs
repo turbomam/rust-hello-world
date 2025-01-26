@@ -1,8 +1,38 @@
-use futures::stream::TryStreamExt;  // Changed from the previous import
+use clap::Parser;
+use duckdb::{params, Connection, Result};
+use futures::stream::TryStreamExt;
 use mongodb::{bson::doc, options::ClientOptions, Client, Collection, Cursor};
 use serde::{Deserialize, Serialize};
-use duckdb::{params, Connection, Result};
 use serde_json::Value;
+
+/// Process biosample attributes from MongoDB to DuckDB
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// MongoDB connection string
+    #[arg(long, default_value = "mongodb://localhost:27017")]
+    mongo_uri: String,
+
+    /// MongoDB database name
+    #[arg(long, default_value = "biosamples")]
+    mongo_db: String,
+
+    /// MongoDB collection name
+    #[arg(long, default_value = "biosamples")]
+    mongo_collection: String,
+
+    /// Output DuckDB database file
+    #[arg(long, default_value = "biosample_attributes.db")]
+    output_db: String,
+
+    /// Number of biosamples to process (0 for all)
+    #[arg(long, default_value = "10")]
+    limit: i64,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AttributeData {
@@ -26,18 +56,33 @@ struct Biosample {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let connection_string = "mongodb://localhost:27017";
+    let args = Args::parse();
 
-    let client_options = ClientOptions::parse(connection_string).await?;
+    if args.verbose {
+        println!("Connecting to MongoDB at {}", args.mongo_uri);
+    }
+
+    let client_options = ClientOptions::parse(&args.mongo_uri).await?;
     let client = Client::with_options(client_options)?;
 
-    let db = client.database("biosamples");
-    let collection: Collection<Biosample> = db.collection("biosamples");
+    let db = client.database(&args.mongo_db);
+    let collection: Collection<Biosample> = db.collection(&args.mongo_collection);
 
-    let find_options = mongodb::options::FindOptions::builder().limit(10).build();
+    let find_options = if args.limit > 0 {
+        mongodb::options::FindOptions::builder()
+            .limit(args.limit)
+            .build()
+    } else {
+        mongodb::options::FindOptions::builder().build()
+    };
+
+    if args.verbose {
+        println!("Setting up DuckDB at {}", args.output_db);
+    }
+
     let mut cursor: Cursor<Biosample> = collection.find(doc! {}, find_options).await?;
 
-    let duckdb_conn = Connection::open("biosample_attributes.db")?;
+    let duckdb_conn = Connection::open(&args.output_db)?;
 
     // Drop existing table if it exists
     duckdb_conn.execute("DROP TABLE IF EXISTS attribute", [])?;
@@ -60,10 +105,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(biosample) = cursor.try_next().await? {
         biosample_count += 1;
-        println!(
-            "Processing biosample {} (ID: {})",
-            biosample_count, biosample.id
-        );
+        if args.verbose {
+            println!(
+                "Processing biosample {} (ID: {})",
+                biosample_count, biosample.id
+            );
+        }
 
         let mut stmt = duckdb_conn.prepare(
             "INSERT INTO attribute (content, attribute_name, id, harmonized_name, display_name, unit)
@@ -74,12 +121,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(attribute_obj) = attributes.as_object() {
                 if let Some(attribute_array) = attribute_obj.get("Attribute") {
                     if let Some(attrs) = attribute_array.as_array() {
-                        println!("  Found {} attributes", attrs.len());
+                        if args.verbose {
+                            println!("  Found {} attributes", attrs.len());
+                        }
                         for attr_value in attrs {
                             if let Ok(attr) =
                                 serde_json::from_value::<AttributeData>(attr_value.clone())
                             {
-                                if !attr.extra.is_empty() {
+                                if !attr.extra.is_empty() && args.verbose {
                                     println!("  Extra fields found: {:?}", attr.extra);
                                 }
 
@@ -93,20 +142,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ])?;
 
                                 attr_id += 1;
-                            } else {
+                            } else if args.verbose {
                                 println!("  Failed to parse attribute: {:?}", attr_value);
                             }
                         }
-                    } else {
+                    } else if args.verbose {
                         println!("  Attribute is not an array");
                     }
-                } else {
+                } else if args.verbose {
                     println!("  No Attribute field found");
                 }
-            } else {
+            } else if args.verbose {
                 println!("  Attributes is not an object");
             }
-        } else {
+        } else if args.verbose {
             println!("  No Attributes found");
         }
     }

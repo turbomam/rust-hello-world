@@ -1,13 +1,13 @@
 use clap::Parser;
 use duckdb::{params, Connection, Result};
 use futures::stream::TryStreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use mongodb::{bson::doc, options::ClientOptions, Client, Collection, Cursor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Process biosample attributes from MongoDB to DuckDB
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
 struct Args {
     /// MongoDB connection string
     #[arg(long, default_value = "mongodb://localhost:27017")]
@@ -29,6 +29,10 @@ struct Args {
     #[arg(long, default_value = "10")]
     limit: i64,
 
+    /// Total number of biosamples in MongoDB
+    #[arg(long, default_value = "45000000")]
+    total_biosamples: u64,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -46,10 +50,20 @@ struct AttributeData {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct PackageData {
+    content: Option<String>,
+    display_name: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct Biosample {
     id: String,
     #[serde(rename = "Attributes")]
     attributes: Option<serde_json::Value>,
+    #[serde(rename = "Package")]
+    package: Option<serde_json::Value>,
     #[serde(flatten)]
     extra: std::collections::BTreeMap<String, Value>,
 }
@@ -84,10 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let duckdb_conn = Connection::open(&args.output_db)?;
 
-    // Drop existing table if it exists
+    // Drop existing tables if they exist
     duckdb_conn.execute("DROP TABLE IF EXISTS attribute", [])?;
+    duckdb_conn.execute("DROP TABLE IF EXISTS package", [])?;
 
-    // Create table with exact schema from DBeaver
+    // Create tables with fixed schemas
     duckdb_conn.execute(
         "CREATE TABLE attribute (
             content VARCHAR,
@@ -100,23 +115,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         [],
     )?;
 
-    let mut biosample_count = 0;
-    let mut attr_id = 1i64; // Counter for the id column
+    duckdb_conn.execute(
+        "CREATE TABLE package (
+            content VARCHAR,
+            display_name VARCHAR,
+            id BIGINT
+        )",
+        [],
+    )?;
+
+    // Setup progress bar
+    let total = if args.limit > 0 {
+        args.limit as u64
+    } else {
+        args.total_biosamples
+    };
+    let pb = ProgressBar::new(total);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({per_sec}, {eta})")
+        .unwrap()
+        .progress_chars("#>-"));
+
+    let mut processed_count = 0u64;
+
+    let mut attr_stmt = duckdb_conn.prepare(
+        "INSERT INTO attribute (content, attribute_name, id, harmonized_name, display_name, unit)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )?;
+
+    let mut pkg_stmt = duckdb_conn.prepare(
+        "INSERT INTO package (content, display_name, id)
+         VALUES (?, ?, ?)",
+    )?;
 
     while let Some(biosample) = cursor.try_next().await? {
-        biosample_count += 1;
-        if args.verbose {
-            println!(
-                "Processing biosample {} (ID: {})",
-                biosample_count, biosample.id
-            );
-        }
+        processed_count += 1;
+        pb.set_position(processed_count);
 
-        let mut stmt = duckdb_conn.prepare(
-            "INSERT INTO attribute (content, attribute_name, id, harmonized_name, display_name, unit)
-             VALUES (?, ?, ?, ?, ?, ?)"
-        )?;
-
+        // Process Attributes
         if let Some(attributes) = biosample.attributes {
             if let Some(attribute_obj) = attributes.as_object() {
                 if let Some(attribute_array) = attribute_obj.get("Attribute") {
@@ -129,19 +165,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 serde_json::from_value::<AttributeData>(attr_value.clone())
                             {
                                 if !attr.extra.is_empty() && args.verbose {
-                                    println!("  Extra fields found: {:?}", attr.extra);
+                                    println!("  Extra attribute fields found: {:?}", attr.extra);
                                 }
 
-                                stmt.execute(params![
+                                attr_stmt.execute(params![
                                     attr.content.as_deref().unwrap_or(""),
                                     attr.attribute_name.as_deref().unwrap_or(""),
-                                    attr_id,
+                                    biosample.id.parse::<i64>().unwrap_or(-1),
                                     attr.harmonized_name.as_deref().unwrap_or(""),
                                     attr.display_name.as_deref().unwrap_or(""),
                                     attr.unit.as_deref().unwrap_or(""),
                                 ])?;
-
-                                attr_id += 1;
                             } else if args.verbose {
                                 println!("  Failed to parse attribute: {:?}", attr_value);
                             }
@@ -158,9 +192,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if args.verbose {
             println!("  No Attributes found");
         }
+
+        // Process Package
+        if let Some(package) = &biosample.package {
+            match serde_json::from_value::<PackageData>(package.clone()) {
+                Ok(pkg) => {
+                    if !pkg.extra.is_empty() && args.verbose {
+                        println!(
+                            "Extra package fields found for biosample {}: {:?}",
+                            biosample.id, pkg.extra
+                        );
+                    }
+
+                    pkg_stmt.execute(params![
+                        pkg.content.as_deref().unwrap_or(""),
+                        pkg.display_name.as_deref().unwrap_or(""),
+                        biosample.id.parse::<i64>().unwrap_or(-1),
+                    ])?;
+                }
+                Err(e) => {
+                    if args.verbose {
+                        println!(
+                            "Failed to parse package for biosample {}: {:?}",
+                            biosample.id, e
+                        );
+                    }
+                }
+            }
+        }
     }
 
-    println!("Processed {} biosamples total", biosample_count);
+    pb.finish_with_message("Processing complete");
+    println!("Processed {} biosamples total", processed_count);
 
     Ok(())
 }
